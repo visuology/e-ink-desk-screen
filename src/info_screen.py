@@ -32,7 +32,7 @@ BUSY_SHOW_AS = {"busy", "tentative", "oof", "workingElsewhere", "unknown"}
 FOCUS_PRESETS = [25, 50, 90]
 VIEWS = {"home", "agenda", "focus", "tomorrow"}
 RESERVED_MSAL_SCOPES = {"offline_access", "openid", "profile"}
-MENU_WIDTH = 32
+MENU_WIDTH = 28
 CONTENT_LEFT = MENU_WIDTH + 8
 CONTENT_RIGHT_MARGIN = 8
 WEATHER_CODES = {
@@ -718,20 +718,37 @@ def draw_top(draw: ImageDraw.ImageDraw, width: int, fonts: dict, now: datetime, 
     draw.text((meta_x, 19), truncate(draw, subtitle, fonts["tiny"], width - meta_x - CONTENT_RIGHT_MARGIN), font=fonts["tiny"], fill=255)
 
 
+def draw_menu_icon(draw: ImageDraw.ImageDraw, key: str, cx: int, cy: int, fill: int):
+    if key == "home":
+        draw.line((cx - 7, cy, cx, cy - 7, cx + 7, cy), fill=fill, width=2)
+        draw.rectangle((cx - 5, cy, cx + 5, cy + 7), outline=fill)
+        draw.line((cx - 1, cy + 7, cx - 1, cy + 3, cx + 2, cy + 3, cx + 2, cy + 7), fill=fill)
+    elif key == "agenda":
+        draw.rectangle((cx - 7, cy - 8, cx + 7, cy + 8), outline=fill)
+        draw.line((cx - 4, cy - 3, cx + 5, cy - 3), fill=fill)
+        draw.line((cx - 4, cy + 2, cx + 5, cy + 2), fill=fill)
+        draw.line((cx - 4, cy + 7, cx + 4, cy + 7), fill=fill)
+    elif key == "focus":
+        draw.ellipse((cx - 8, cy - 8, cx + 8, cy + 8), outline=fill)
+        draw.ellipse((cx - 3, cy - 3, cx + 3, cy + 3), outline=fill)
+        draw.point((cx, cy), fill=fill)
+    elif key == "refresh":
+        draw.arc((cx - 8, cy - 8, cx + 8, cy + 8), 35, 300, fill=fill, width=2)
+        draw.line((cx + 6, cy - 7, cx + 8, cy - 1, cx + 2, cy - 2), fill=fill)
+
+
 def draw_left_menu(draw: ImageDraw.ImageDraw, _width: int, height: int, fonts: dict, active: str):
     labels = [("home", "Hm"), ("agenda", "Ag"), ("focus", "Fc"), ("refresh", "Rf")]
     segment = height // 4
     draw.rectangle((0, 0, MENU_WIDTH, height), outline=0, fill=255)
-    for index, (key, label) in enumerate(labels):
+    for index, (key, _label) in enumerate(labels):
         y0 = index * segment
         y1 = height if index == 3 else (index + 1) * segment
         fill = 0
         if key == active:
             draw.rectangle((0, y0, MENU_WIDTH, y1), fill=0)
             fill = 255
-        text_width = draw.textlength(label, font=fonts["tiny_bold"])
-        text_y = y0 + max(2, (y1 - y0 - 10) // 2)
-        draw.text((max(2, (MENU_WIDTH - text_width) // 2), text_y), label, font=fonts["tiny_bold"], fill=fill)
+        draw_menu_icon(draw, key, MENU_WIDTH // 2, y0 + (y1 - y0) // 2, fill)
         if index:
             draw.line((4, y0, MENU_WIDTH - 4, y0), fill=0)
     draw.line((MENU_WIDTH, 0, MENU_WIDTH, height), fill=0)
@@ -796,6 +813,108 @@ def signal_line(state: dict) -> str:
     return " | ".join(parts)
 
 
+def weather_line(state: dict) -> str:
+    weather = state.get("weather") or {}
+    if not weather.get("enabled") or weather.get("error"):
+        return ""
+    parts = []
+    temp = weather.get("temperature")
+    summary = weather.get("summary") or "weather"
+    if temp is not None:
+        parts.append(f"{round(float(temp))}C {summary}")
+    else:
+        parts.append(summary.title())
+    commute_probability = weather.get("commute_precip_probability")
+    commute_label = weather.get("commute_label")
+    if commute_probability is not None and commute_label:
+        parts.append(f"{commute_probability}% rain {commute_label}")
+    return " | ".join(parts)
+
+
+def booked_minutes(events: list[dict]) -> int:
+    total = 0
+    for event in events:
+        start_dt = parse_state_dt(event.get("start"))
+        end_dt = parse_state_dt(event.get("end"))
+        if start_dt and end_dt:
+            total += max(0, int((end_dt - start_dt).total_seconds() // 60))
+    return total
+
+
+def event_subject(event: dict | None, fallback: str = "Open") -> str:
+    return (event or {}).get("subject") or fallback
+
+
+def event_start_label(event: dict | None, prefix: str = "") -> str:
+    start_dt = parse_state_dt((event or {}).get("start"))
+    if not start_dt:
+        return prefix.strip()
+    return f"{prefix}{start_dt:%H:%M}".strip()
+
+
+def draw_home_row(
+    draw: ImageDraw.ImageDraw,
+    fonts: dict,
+    width: int,
+    y: int,
+    label: str,
+    headline: str,
+    detail: str = "",
+):
+    draw.text((CONTENT_LEFT, y), label.upper(), font=fonts["tiny_bold"], fill=0)
+    text_x = CONTENT_LEFT + 44
+    draw.text((text_x, y - 3), truncate(draw, headline, fonts["body_bold"], width - text_x - CONTENT_RIGHT_MARGIN), font=fonts["body_bold"], fill=0)
+    if detail:
+        draw.text((text_x, y + 12), truncate(draw, detail, fonts["tiny"], width - text_x - CONTENT_RIGHT_MARGIN), font=fonts["tiny"], fill=0)
+
+
+def draw_event_cell(
+    draw: ImageDraw.ImageDraw,
+    fonts: dict,
+    x: int,
+    y: int,
+    w: int,
+    event: dict,
+    label: str | None = None,
+    show_meta: bool = True,
+):
+    time_label = label or format_range(event)
+    draw.text((x, y), truncate(draw, time_label, fonts["tiny_bold"], w), font=fonts["tiny_bold"], fill=0)
+    draw.text((x, y + 12), truncate(draw, event_subject(event, "Meeting"), fonts["body_bold"], w), font=fonts["body_bold"], fill=0)
+    meta = (event.get("location") or event.get("organizer") or "") if show_meta else ""
+    if meta:
+        draw.text((x, y + 27), truncate(draw, meta, fonts["tiny"], w), font=fonts["tiny"], fill=0)
+
+
+def render_quiet_home(config: Config, state: dict) -> Image.Image:
+    _, canvas, draw, width, height = new_canvas(config)
+    fonts = get_fonts(config)
+    now = datetime.now(config.timezone)
+    schedule = state.get("schedule") or {}
+    tomorrow = tomorrow_busy_events(schedule)
+    first = tomorrow[0] if tomorrow else schedule.get("next_tomorrow")
+    first_start = parse_state_dt(first.get("start")) if first else None
+    booked = booked_minutes(tomorrow)
+
+    draw_top(draw, width, fonts, now, config.user_name, "Quiet")
+    draw_fit_text(draw, (CONTENT_LEFT, 46), "TOMORROW", fonts, content_width(width))
+    if first:
+        headline = f"First {first_start:%H:%M}" if first_start else "First meeting"
+        draw.text((CONTENT_LEFT, 74), truncate(draw, headline, fonts["body_bold"], content_width(width)), font=fonts["body_bold"], fill=0)
+        draw.text((CONTENT_LEFT, 90), truncate(draw, event_subject(first, "Meeting"), fonts["body"], content_width(width)), font=fonts["body"], fill=0)
+        draw.text((CONTENT_LEFT, 112), f"{len(tomorrow)} meetings / {booked // 60}h {booked % 60:02d}m booked", font=fonts["tiny_bold"], fill=0)
+    else:
+        draw.text((CONTENT_LEFT, 76), "No meetings", font=fonts["body_bold"], fill=0)
+        draw.text((CONTENT_LEFT, 92), "Calendar is open", font=fonts["tiny"], fill=0)
+
+    line = weather_line(state)
+    if line:
+        draw.line((CONTENT_LEFT, 136, width - CONTENT_RIGHT_MARGIN, 136), fill=0)
+        draw.text((CONTENT_LEFT, 146), truncate(draw, line, fonts["body_bold"], content_width(width)), font=fonts["body_bold"], fill=0)
+    draw_left_menu(draw, width, height, fonts, "home")
+    return canvas
+
+
 def render_home(config: Config, state: dict) -> Image.Image:
     _, canvas, draw, width, height = new_canvas(config)
     fonts = get_fonts(config)
@@ -806,6 +925,7 @@ def render_home(config: Config, state: dict) -> Image.Image:
     work_end = combine_local(config, now.date(), config.office_end_hour)
 
     soon = meeting_starts_soon(config, now, upcoming)
+    work_hours = config.office_start_hour <= now.hour < config.office_end_hour
 
     if active_focus:
         status = "FOCUS"
@@ -819,56 +939,45 @@ def render_home(config: Config, state: dict) -> Image.Image:
         minutes = max(0, int((start_dt - now).total_seconds() // 60)) if start_dt else 0
         status = "MEETING SOON"
         detail = f"{soon.get('subject', 'Meeting')} in {minutes} min"
-    elif config.office_start_hour <= now.hour < config.office_end_hour:
+    elif work_hours:
         next_start = parse_state_dt(upcoming[0]["start"]) if upcoming else work_end
         free_until = min(next_start, work_end)
         minutes = max(0, int((free_until - now).total_seconds() // 60))
         status = "AVAILABLE"
         detail = f"{minutes} min free" if minutes < 180 else f"Free until {free_until:%H:%M}"
     else:
-        tomorrow = tomorrow_busy_events(schedule)
-        first_tomorrow = tomorrow[0] if tomorrow else schedule.get("next_tomorrow")
-        first_start = parse_state_dt(first_tomorrow.get("start")) if first_tomorrow else None
-        status = "TOMORROW" if first_tomorrow else "OFF HOURS"
-        detail = f"First {first_start:%H:%M} / {len(tomorrow)} meetings" if first_start else f"Work starts {config.office_start_hour:02d}:00"
+        return render_quiet_home(config, state)
 
     draw_top(draw, width, fonts, now, config.user_name, f"{now:%a %d %b}")
     draw_fit_text(draw, (CONTENT_LEFT, 44), status, fonts, content_width(width))
     draw.text((CONTENT_LEFT, 69), truncate(draw, detail, fonts["body_bold"], content_width(width)), font=fonts["body_bold"], fill=0)
 
-    y = 91
+    y = 94
     if current:
-        draw.text((CONTENT_LEFT, y), "Now", font=fonts["tiny_bold"], fill=0)
-        subject_x = CONTENT_LEFT + 36
-        for i, line in enumerate(wrap_text(draw, current.get("subject", "Busy"), fonts["body"], width - subject_x - CONTENT_RIGHT_MARGIN, 2)):
-            draw.text((subject_x, y - 3 + i * 15), line, font=fonts["body"], fill=0)
+        draw_home_row(draw, fonts, width, y, "Now", event_subject(current, "Busy"), format_range(current))
     elif upcoming:
         next_event = upcoming[0]
-        start_dt = parse_state_dt(next_event.get("start"))
-        draw.text((CONTENT_LEFT, y), f"Next {start_dt:%H:%M}" if start_dt else "Next", font=fonts["tiny_bold"], fill=0)
-        subject_x = CONTENT_LEFT + 78
-        draw.text((subject_x, y - 3), truncate(draw, next_event.get("subject", "Scheduled"), fonts["body"], width - subject_x - CONTENT_RIGHT_MARGIN), font=fonts["body"], fill=0)
-    elif schedule.get("next_tomorrow"):
-        next_event = schedule["next_tomorrow"]
-        start_dt = parse_state_dt(next_event.get("start"))
-        draw.text((CONTENT_LEFT, y), f"Tom {start_dt:%H:%M}" if start_dt else "Tomorrow", font=fonts["tiny_bold"], fill=0)
-        subject_x = CONTENT_LEFT + 70
-        draw.text((subject_x, y - 3), truncate(draw, next_event.get("subject", "Scheduled"), fonts["body"], width - subject_x - CONTENT_RIGHT_MARGIN), font=fonts["body"], fill=0)
+        draw_home_row(draw, fonts, width, y, "Next", event_subject(next_event, "Meeting"), event_start_label(next_event))
     else:
-        draw.text((CONTENT_LEFT, y), "No more meetings", font=fonts["body_bold"], fill=0)
+        draw_home_row(draw, fonts, width, y, "Next", "No more meetings", "")
+
+    later_event = upcoming[1] if len(upcoming) > 1 else schedule.get("next_tomorrow")
+    if later_event:
+        draw_home_row(draw, fonts, width, 122, "Later", event_subject(later_event, "Meeting"), event_start_label(later_event, "Tom " if later_event == schedule.get("next_tomorrow") else ""))
+    else:
+        draw_home_row(draw, fonts, width, 122, "Later", "Clear", "")
 
     office_start = combine_local(config, now.date(), config.office_start_hour)
     office_end = combine_local(config, now.date(), config.office_end_hour)
     open_minutes = max(0, int((office_end - office_start).total_seconds() // 60) - busy_minutes(schedule.get("today", []), office_start, office_end))
-    draw.line((CONTENT_LEFT, 122, width - CONTENT_RIGHT_MARGIN, 122), fill=0)
+    draw.line((CONTENT_LEFT, 148, width - CONTENT_RIGHT_MARGIN, 148), fill=0)
     summary = f"Today {schedule.get('events_today_count', 0)} meetings"
     if schedule.get("all_day_count"):
         summary = f"{summary} + {schedule['all_day_count']} all-day"
-    draw.text((CONTENT_LEFT, 130), truncate(draw, summary, fonts["tiny_bold"], content_width(width)), font=fonts["tiny_bold"], fill=0)
-    draw.text((CONTENT_LEFT, 144), truncate(draw, f"{open_minutes // 60}h {open_minutes % 60:02d}m open in work day", fonts["tiny"], content_width(width)), font=fonts["tiny"], fill=0)
+    draw.text((CONTENT_LEFT, 153), truncate(draw, f"{summary} / {open_minutes // 60}h {open_minutes % 60:02d}m open", fonts["tiny"], content_width(width)), font=fonts["tiny"], fill=0)
     signals = signal_line(state)
     if signals:
-        draw.text((CONTENT_LEFT, 158), truncate(draw, signals, fonts["tiny"], content_width(width)), font=fonts["tiny"], fill=0)
+        draw.text((CONTENT_LEFT, 164), truncate(draw, signals, fonts["tiny"], content_width(width)), font=fonts["tiny"], fill=0)
     draw_left_menu(draw, width, height, fonts, "home")
     return canvas
 
@@ -885,16 +994,17 @@ def render_agenda(config: Config, state: dict) -> Image.Image:
     if not rows:
         draw.text((CONTENT_LEFT, 56), "Clear for today", font=fonts["headline"], fill=0)
     else:
-        y = 40
-        for label, event in rows[:4]:
-            label_x = CONTENT_LEFT
-            subject_x = CONTENT_LEFT + 78
-            draw.text((label_x, y), truncate(draw, label, fonts["tiny_bold"], 72), font=fonts["tiny_bold"], fill=0)
-            draw.text((subject_x, y - 1), truncate(draw, event.get("subject", "Untitled"), fonts["body_bold"], width - subject_x - CONTENT_RIGHT_MARGIN), font=fonts["body_bold"], fill=0)
-            meta = " / ".join(part for part in (event.get("location"), event.get("organizer")) if part and config.privacy_mode == "normal")
-            if meta:
-                draw.text((subject_x, y + 13), truncate(draw, meta, fonts["tiny"], width - subject_x - CONTENT_RIGHT_MARGIN), font=fonts["tiny"], fill=0)
-            y += 28
+        gap = 8
+        col_w = (content_width(width) - gap) // 2
+        for index, (label, event) in enumerate(rows[:6]):
+            col = index % 2
+            row = index // 2
+            x = CONTENT_LEFT + col * (col_w + gap)
+            y = 42 + row * 42
+            draw_event_cell(draw, fonts, x, y, col_w, event, label=label, show_meta=config.privacy_mode == "normal")
+            if col == 1:
+                draw.line((CONTENT_LEFT, y - 5, width - CONTENT_RIGHT_MARGIN, y - 5), fill=0)
+        draw.line((CONTENT_LEFT + col_w + gap // 2, 40, CONTENT_LEFT + col_w + gap // 2, 166), fill=0)
     draw_left_menu(draw, width, height, fonts, "agenda")
     return canvas
 
@@ -921,12 +1031,15 @@ def render_tomorrow(config: Config, state: dict) -> Image.Image:
         header = f"First {first_start:%H:%M} / {len(tomorrow)} meetings" if first_start else f"{len(tomorrow)} meetings"
         draw.text((CONTENT_LEFT, 45), truncate(draw, header, fonts["body_bold"], content_width(width)), font=fonts["body_bold"], fill=0)
         draw.text((CONTENT_LEFT, 61), f"{total_minutes // 60}h {total_minutes % 60:02d}m booked", font=fonts["tiny"], fill=0)
-        y = 82
-        for event in tomorrow[:3]:
-            draw.text((CONTENT_LEFT, y), truncate(draw, format_range(event), fonts["tiny_bold"], 72), font=fonts["tiny_bold"], fill=0)
-            subject_x = CONTENT_LEFT + 78
-            draw.text((subject_x, y - 1), truncate(draw, event.get("subject", "Meeting"), fonts["body_bold"], width - subject_x - CONTENT_RIGHT_MARGIN), font=fonts["body_bold"], fill=0)
-            y += 24
+        gap = 8
+        col_w = (content_width(width) - gap) // 2
+        for index, event in enumerate(tomorrow[:4]):
+            col = index % 2
+            row = index // 2
+            x = CONTENT_LEFT + col * (col_w + gap)
+            y = 84 + row * 36
+            draw_event_cell(draw, fonts, x, y, col_w, event, show_meta=config.privacy_mode == "normal")
+        draw.line((CONTENT_LEFT + col_w + gap // 2, 82, CONTENT_LEFT + col_w + gap // 2, 145), fill=0)
 
     signals = signal_line(state)
     if signals:

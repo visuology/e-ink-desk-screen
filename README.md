@@ -6,14 +6,14 @@ Personal desk assistant for a Raspberry Pi Zero and Waveshare 2.7inch e-Paper HA
 
 It shows:
 
-- Home: availability, next meeting, and today summary
-- Agenda: next meetings
+- Home: Now / Next / Later hierarchy, meeting warnings, and today summary
+- Agenda: two-column next-meeting grid
 - Focus: local focus timer
-- Tomorrow: first meeting, meeting count, and booked time
+- Tomorrow: two-column day preview with first meeting, meeting count, and booked time
 - Mail/weather signal: unread count, high-priority unread count, current weather, and commute-hour rain chance
 - Diagnostics: Wi-Fi, IP, auth mode, display driver
 
-The compact on-screen navigation rail is on the left side to match the physical HAT buttons.
+The compact icon navigation rail is on the left side to match the physical HAT buttons. After work hours, Home switches into a quiet mode that shows only tomorrow and weather.
 
 ## Buttons
 
@@ -95,6 +95,7 @@ python3 -m venv .venv
 .venv/bin/python src/info_screen.py --sample --preview docs/screenshots/agenda.png --view agenda
 .venv/bin/python src/info_screen.py --sample --preview docs/screenshots/focus.png --view focus
 .venv/bin/python src/info_screen.py --sample --preview docs/screenshots/tomorrow.png --view tomorrow
+DESK_OFFICE_END_HOUR=16 .venv/bin/python src/info_screen.py --sample --preview docs/screenshots/quiet.png --view home
 ```
 
 The live Pi render is saved to `docs/screenshots/pi-current-render.png` for documentation.
