@@ -1,0 +1,6 @@
+msal
+Pillow
+python-dateutil
+pytz
+requests
+

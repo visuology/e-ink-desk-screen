@@ -1,0 +1,13 @@
+[Unit]
+Description=Desk e-ink display refresh
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=__DESK_USER__
+WorkingDirectory=/home/__DESK_USER__/info_screen_desk
+EnvironmentFile=/etc/info-screen-desk.env
+ExecStart=/home/__DESK_USER__/info_screen_desk/run_info_screen.sh
+StandardOutput=journal
+StandardError=journal

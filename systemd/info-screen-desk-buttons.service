@@ -1,0 +1,20 @@
+[Unit]
+Description=Desk e-ink button listener
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=90
+User=__DESK_USER__
+WorkingDirectory=/home/__DESK_USER__/info_screen_desk
+EnvironmentFile=/etc/info-screen-desk.env
+ExecStart=/usr/bin/python3 /home/__DESK_USER__/info_screen_desk/src/info_screen.py --listen
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
