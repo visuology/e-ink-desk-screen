@@ -32,7 +32,7 @@ BUSY_SHOW_AS = {"busy", "tentative", "oof", "workingElsewhere", "unknown"}
 FOCUS_PRESETS = [25, 50, 90]
 VIEWS = {"home", "agenda", "focus", "tomorrow"}
 RESERVED_MSAL_SCOPES = {"offline_access", "openid", "profile"}
-MENU_WIDTH = 48
+MENU_WIDTH = 32
 CONTENT_LEFT = MENU_WIDTH + 8
 CONTENT_RIGHT_MARGIN = 8
 WEATHER_CODES = {
@@ -719,7 +719,7 @@ def draw_top(draw: ImageDraw.ImageDraw, width: int, fonts: dict, now: datetime, 
 
 
 def draw_left_menu(draw: ImageDraw.ImageDraw, _width: int, height: int, fonts: dict, active: str):
-    labels = [("home", "Home"), ("agenda", "Agenda"), ("focus", "Focus"), ("refresh", "Refresh")]
+    labels = [("home", "Hm"), ("agenda", "Ag"), ("focus", "Fc"), ("refresh", "Rf")]
     segment = height // 4
     draw.rectangle((0, 0, MENU_WIDTH, height), outline=0, fill=255)
     for index, (key, label) in enumerate(labels):
@@ -851,8 +851,8 @@ def render_home(config: Config, state: dict) -> Image.Image:
     elif schedule.get("next_tomorrow"):
         next_event = schedule["next_tomorrow"]
         start_dt = parse_state_dt(next_event.get("start"))
-        draw.text((CONTENT_LEFT, y), f"Tomorrow {start_dt:%H:%M}" if start_dt else "Tomorrow", font=fonts["tiny_bold"], fill=0)
-        subject_x = CONTENT_LEFT + 94
+        draw.text((CONTENT_LEFT, y), f"Tom {start_dt:%H:%M}" if start_dt else "Tomorrow", font=fonts["tiny_bold"], fill=0)
+        subject_x = CONTENT_LEFT + 70
         draw.text((subject_x, y - 3), truncate(draw, next_event.get("subject", "Scheduled"), fonts["body"], width - subject_x - CONTENT_RIGHT_MARGIN), font=fonts["body"], fill=0)
     else:
         draw.text((CONTENT_LEFT, y), "No more meetings", font=fonts["body_bold"], fill=0)

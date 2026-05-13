@@ -13,7 +13,7 @@ It shows:
 - Mail/weather signal: unread count, high-priority unread count, current weather, and commute-hour rain chance
 - Diagnostics: Wi-Fi, IP, auth mode, display driver
 
-The on-screen navigation rail is on the left side to match the physical HAT buttons.
+The compact on-screen navigation rail is on the left side to match the physical HAT buttons.
 
 ## Buttons
 
