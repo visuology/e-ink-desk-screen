@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -35,6 +36,13 @@ RESERVED_MSAL_SCOPES = {"offline_access", "openid", "profile"}
 MENU_WIDTH = 28
 CONTENT_LEFT = MENU_WIDTH + 8
 CONTENT_RIGHT_MARGIN = 8
+PROFILE_LABELS = {
+    "workday": "Workday",
+    "weekend": "Weekend",
+    "meeting-heavy": "Meeting-heavy",
+    "focus-day": "Focus day",
+    "quiet": "Quiet",
+}
 WEATHER_CODES = {
     0: "clear",
     1: "mainly clear",
@@ -84,6 +92,17 @@ class Config:
     weather_label: str
     weather_refresh_minutes: int
     commute_weather_hour: int
+    weather_rain_probability_threshold: int
+    weather_precipitation_threshold_mm: float
+    weather_wind_threshold_kmh: int
+    weather_cold_threshold_c: int
+    weather_hot_threshold_c: int
+    nightly_clear_enabled: bool
+    nightly_clear_hour: int
+    profile_mode: str
+    profile_meeting_heavy_count: int
+    profile_meeting_heavy_busy_minutes: int
+    profile_focus_day_open_hours: int
     save_previews: bool
     preview_dir: Path
     state_file: Path
@@ -134,11 +153,12 @@ def env_int(name: str, default: int, minimum: int | None = None) -> int:
     return max(minimum, value) if minimum is not None else value
 
 
-def env_float(name: str) -> float | None:
+def env_float(name: str, default: float | None = None, minimum: float | None = None) -> float | None:
     value = os.environ.get(name, "").strip()
     if not value:
-        return None
-    return float(value)
+        return default
+    result = float(value)
+    return max(minimum, result) if minimum is not None else result
 
 
 def load_config(require_credentials: bool = True) -> Config:
@@ -200,6 +220,17 @@ def load_config(require_credentials: bool = True) -> Config:
         weather_label=os.environ.get("DESK_WEATHER_LABEL", ""),
         weather_refresh_minutes=env_int("DESK_WEATHER_REFRESH_MINUTES", 30, minimum=5),
         commute_weather_hour=env_int("DESK_COMMUTE_WEATHER_HOUR", env_int("DESK_OFFICE_END_HOUR", 18)),
+        weather_rain_probability_threshold=env_int("DESK_WEATHER_RAIN_THRESHOLD_PERCENT", 35, minimum=1),
+        weather_precipitation_threshold_mm=env_float("DESK_WEATHER_PRECIP_THRESHOLD_MM", 0.2, minimum=0.0) or 0.0,
+        weather_wind_threshold_kmh=env_int("DESK_WEATHER_WIND_THRESHOLD_KMH", 35, minimum=1),
+        weather_cold_threshold_c=env_int("DESK_WEATHER_COLD_THRESHOLD_C", 3),
+        weather_hot_threshold_c=env_int("DESK_WEATHER_HOT_THRESHOLD_C", 28),
+        nightly_clear_enabled=env_bool("DESK_NIGHTLY_CLEAR_ENABLED", True),
+        nightly_clear_hour=env_int("DESK_NIGHTLY_CLEAR_HOUR", 3, minimum=0) % 24,
+        profile_mode=os.environ.get("DESK_PROFILE_MODE", "auto").strip().lower(),
+        profile_meeting_heavy_count=env_int("DESK_PROFILE_MEETING_HEAVY_COUNT", 5, minimum=1),
+        profile_meeting_heavy_busy_minutes=env_int("DESK_PROFILE_MEETING_HEAVY_BUSY_MINUTES", 240, minimum=30),
+        profile_focus_day_open_hours=env_int("DESK_PROFILE_FOCUS_DAY_OPEN_HOURS", 4, minimum=1),
         save_previews=env_bool("DESK_SAVE_PREVIEWS", False),
         preview_dir=Path(os.environ.get("DESK_PREVIEW_DIR", str(cache_dir / "previews"))),
         state_file=Path(os.environ.get("DESK_STATE_FILE", str(cache_dir / "state.json"))),
@@ -224,6 +255,8 @@ def default_state() -> dict:
         "focus_preset_index": 1,
         "last_sync_iso": None,
         "last_error": None,
+        "last_panel_clear_date": None,
+        "profile": "auto",
         "schedule": None,
         "mail": None,
         "weather": None,
@@ -766,6 +799,45 @@ def busy_minutes(events: list[dict], start: datetime, end: datetime) -> int:
     return total
 
 
+def schedule_metrics(config: Config, state: dict, now: datetime) -> dict:
+    schedule = state.get("schedule") or {}
+    office_start = combine_local(config, now.date(), config.office_start_hour)
+    office_end = combine_local(config, now.date(), config.office_end_hour)
+    today_events = [event for event in schedule.get("today", []) if event.get("is_busy") and not event.get("is_all_day")]
+    busy = busy_minutes(today_events, office_start, office_end)
+    total = max(0, int((office_end - office_start).total_seconds() // 60))
+    return {
+        "events": len(today_events) or int(schedule.get("events_today_count") or 0),
+        "busy_minutes": busy,
+        "open_minutes": max(0, total - busy),
+    }
+
+
+def profile_label(profile: str) -> str:
+    return PROFILE_LABELS.get(profile, profile.replace("-", " ").title())
+
+
+def resolve_profile(config: Config, state: dict, now: datetime) -> str:
+    configured = config.profile_mode
+    if configured and configured != "auto":
+        return configured if configured in PROFILE_LABELS else "workday"
+
+    if now.weekday() >= 5:
+        return "weekend"
+    if not config.office_start_hour <= now.hour < config.office_end_hour:
+        return "quiet"
+
+    metrics = schedule_metrics(config, state, now)
+    if (
+        metrics["events"] >= config.profile_meeting_heavy_count
+        or metrics["busy_minutes"] >= config.profile_meeting_heavy_busy_minutes
+    ):
+        return "meeting-heavy"
+    if metrics["open_minutes"] >= config.profile_focus_day_open_hours * 60 and metrics["events"] <= 2:
+        return "focus-day"
+    return "workday"
+
+
 def meeting_starts_soon(config: Config, now: datetime, upcoming: list[dict]) -> dict | None:
     if not upcoming:
         return None
@@ -782,7 +854,64 @@ def tomorrow_busy_events(schedule: dict) -> list[dict]:
     return [event for event in schedule.get("tomorrow", []) if event.get("is_busy") and not event.get("is_all_day")]
 
 
-def signal_line(state: dict) -> str:
+def as_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def weather_alerts(config: Config, state: dict) -> list[str]:
+    weather = state.get("weather") or {}
+    if not weather.get("enabled") or weather.get("error"):
+        return []
+
+    alerts: list[str] = []
+    precipitation = as_float(weather.get("precipitation"))
+    if precipitation is not None and precipitation >= config.weather_precipitation_threshold_mm:
+        alerts.append(f"Rain now {precipitation:.1f}mm")
+
+    commute_probability = as_float(weather.get("commute_precip_probability"))
+    commute_precipitation = as_float(weather.get("commute_precipitation"))
+    commute_label = weather.get("commute_label")
+    commute_rain = (
+        commute_probability is not None and commute_probability >= config.weather_rain_probability_threshold
+    ) or (
+        commute_precipitation is not None and commute_precipitation >= config.weather_precipitation_threshold_mm
+    )
+    if commute_label and commute_rain:
+        if commute_probability is not None:
+            alerts.append(f"{round(commute_probability)}% rain {commute_label}")
+        else:
+            alerts.append(f"Rain {commute_label}")
+
+    temperature = as_float(weather.get("temperature"))
+    if temperature is not None and temperature <= config.weather_cold_threshold_c:
+        alerts.append(f"Cold {round(temperature)}C")
+    elif temperature is not None and temperature >= config.weather_hot_threshold_c:
+        alerts.append(f"Hot {round(temperature)}C")
+
+    wind = as_float(weather.get("wind"))
+    if wind is not None and wind >= config.weather_wind_threshold_kmh:
+        alerts.append(f"Wind {round(wind)}km/h")
+
+    return alerts
+
+
+def weather_current_line(state: dict) -> str:
+    weather = state.get("weather") or {}
+    if not weather.get("enabled") or weather.get("error"):
+        return ""
+    temp = as_float(weather.get("temperature"))
+    summary = weather.get("summary") or "weather"
+    if temp is not None:
+        return f"{round(temp)}C {summary}"
+    return summary.title()
+
+
+def signal_line(config: Config, state: dict) -> str:
     parts: list[str] = []
     mail = state.get("mail") or {}
     if mail.get("enabled") and not mail.get("error"):
@@ -797,38 +926,21 @@ def signal_line(state: dict) -> str:
 
     weather = state.get("weather") or {}
     if weather.get("enabled") and not weather.get("error"):
-        temp = weather.get("temperature")
-        summary = weather.get("summary") or "weather"
-        if temp is not None:
-            parts.append(f"{round(float(temp))}C {summary}")
-        else:
-            parts.append(summary.title())
-        commute_probability = weather.get("commute_precip_probability")
-        commute_label = weather.get("commute_label")
-        if commute_probability is not None and commute_label:
-            parts.append(f"{commute_probability}% rain {commute_label}")
+        parts.extend(weather_alerts(config, state)[:2])
     elif weather.get("enabled") and weather.get("error"):
         parts.append("Weather unavailable")
 
     return " | ".join(parts)
 
 
-def weather_line(state: dict) -> str:
+def weather_line(config: Config, state: dict, include_current: bool = False) -> str:
     weather = state.get("weather") or {}
     if not weather.get("enabled") or weather.get("error"):
         return ""
-    parts = []
-    temp = weather.get("temperature")
-    summary = weather.get("summary") or "weather"
-    if temp is not None:
-        parts.append(f"{round(float(temp))}C {summary}")
-    else:
-        parts.append(summary.title())
-    commute_probability = weather.get("commute_precip_probability")
-    commute_label = weather.get("commute_label")
-    if commute_probability is not None and commute_label:
-        parts.append(f"{commute_probability}% rain {commute_label}")
-    return " | ".join(parts)
+    alerts = weather_alerts(config, state)
+    if alerts:
+        return " | ".join(alerts[:2])
+    return weather_current_line(state) if include_current else ""
 
 
 def booked_minutes(events: list[dict]) -> int:
@@ -890,13 +1002,14 @@ def render_quiet_home(config: Config, state: dict) -> Image.Image:
     _, canvas, draw, width, height = new_canvas(config)
     fonts = get_fonts(config)
     now = datetime.now(config.timezone)
+    profile = resolve_profile(config, state, now)
     schedule = state.get("schedule") or {}
     tomorrow = tomorrow_busy_events(schedule)
     first = tomorrow[0] if tomorrow else schedule.get("next_tomorrow")
     first_start = parse_state_dt(first.get("start")) if first else None
     booked = booked_minutes(tomorrow)
 
-    draw_top(draw, width, fonts, now, config.user_name, "Quiet")
+    draw_top(draw, width, fonts, now, config.user_name, profile_label(profile))
     draw_fit_text(draw, (CONTENT_LEFT, 46), "TOMORROW", fonts, content_width(width))
     if first:
         headline = f"First {first_start:%H:%M}" if first_start else "First meeting"
@@ -907,7 +1020,7 @@ def render_quiet_home(config: Config, state: dict) -> Image.Image:
         draw.text((CONTENT_LEFT, 76), "No meetings", font=fonts["body_bold"], fill=0)
         draw.text((CONTENT_LEFT, 92), "Calendar is open", font=fonts["tiny"], fill=0)
 
-    line = weather_line(state)
+    line = weather_line(config, state, include_current=True)
     if line:
         draw.line((CONTENT_LEFT, 136, width - CONTENT_RIGHT_MARGIN, 136), fill=0)
         draw.text((CONTENT_LEFT, 146), truncate(draw, line, fonts["body_bold"], content_width(width)), font=fonts["body_bold"], fill=0)
@@ -923,9 +1036,14 @@ def render_home(config: Config, state: dict) -> Image.Image:
     current, upcoming = resolve_schedule(schedule, now)
     active_focus = focus_until(state, now)
     work_end = combine_local(config, now.date(), config.office_end_hour)
+    metrics = schedule_metrics(config, state, now)
+    profile = resolve_profile(config, state, now)
 
     soon = meeting_starts_soon(config, now, upcoming)
     work_hours = config.office_start_hour <= now.hour < config.office_end_hour
+
+    if profile in {"quiet", "weekend"}:
+        return render_quiet_home(config, state)
 
     if active_focus:
         status = "FOCUS"
@@ -939,6 +1057,13 @@ def render_home(config: Config, state: dict) -> Image.Image:
         minutes = max(0, int((start_dt - now).total_seconds() // 60)) if start_dt else 0
         status = "MEETING SOON"
         detail = f"{soon.get('subject', 'Meeting')} in {minutes} min"
+    elif profile == "meeting-heavy" and upcoming:
+        next_start = parse_state_dt(upcoming[0].get("start"))
+        status = "MEETING DAY"
+        detail = f"Next {next_start:%H:%M}" if next_start else "Meetings ahead"
+    elif profile == "focus-day":
+        status = "FOCUS DAY"
+        detail = f"{metrics['open_minutes'] // 60}h {metrics['open_minutes'] % 60:02d}m open"
     elif work_hours:
         next_start = parse_state_dt(upcoming[0]["start"]) if upcoming else work_end
         free_until = min(next_start, work_end)
@@ -948,7 +1073,7 @@ def render_home(config: Config, state: dict) -> Image.Image:
     else:
         return render_quiet_home(config, state)
 
-    draw_top(draw, width, fonts, now, config.user_name, f"{now:%a %d %b}")
+    draw_top(draw, width, fonts, now, config.user_name, profile_label(profile))
     draw_fit_text(draw, (CONTENT_LEFT, 44), status, fonts, content_width(width))
     draw.text((CONTENT_LEFT, 69), truncate(draw, detail, fonts["body_bold"], content_width(width)), font=fonts["body_bold"], fill=0)
 
@@ -967,15 +1092,12 @@ def render_home(config: Config, state: dict) -> Image.Image:
     else:
         draw_home_row(draw, fonts, width, 122, "Later", "Clear", "")
 
-    office_start = combine_local(config, now.date(), config.office_start_hour)
-    office_end = combine_local(config, now.date(), config.office_end_hour)
-    open_minutes = max(0, int((office_end - office_start).total_seconds() // 60) - busy_minutes(schedule.get("today", []), office_start, office_end))
     draw.line((CONTENT_LEFT, 148, width - CONTENT_RIGHT_MARGIN, 148), fill=0)
-    summary = f"Today {schedule.get('events_today_count', 0)} meetings"
+    summary = f"Today {metrics['events']} meetings"
     if schedule.get("all_day_count"):
         summary = f"{summary} + {schedule['all_day_count']} all-day"
-    draw.text((CONTENT_LEFT, 153), truncate(draw, f"{summary} / {open_minutes // 60}h {open_minutes % 60:02d}m open", fonts["tiny"], content_width(width)), font=fonts["tiny"], fill=0)
-    signals = signal_line(state)
+    draw.text((CONTENT_LEFT, 153), truncate(draw, f"{summary} / {metrics['open_minutes'] // 60}h {metrics['open_minutes'] % 60:02d}m open", fonts["tiny"], content_width(width)), font=fonts["tiny"], fill=0)
+    signals = signal_line(config, state)
     if signals:
         draw.text((CONTENT_LEFT, 164), truncate(draw, signals, fonts["tiny"], content_width(width)), font=fonts["tiny"], fill=0)
     draw_left_menu(draw, width, height, fonts, "home")
@@ -1041,7 +1163,7 @@ def render_tomorrow(config: Config, state: dict) -> Image.Image:
             draw_event_cell(draw, fonts, x, y, col_w, event, show_meta=config.privacy_mode == "normal")
         draw.line((CONTENT_LEFT + col_w + gap // 2, 82, CONTENT_LEFT + col_w + gap // 2, 145), fill=0)
 
-    signals = signal_line(state)
+    signals = signal_line(config, state)
     if signals:
         draw.line((CONTENT_LEFT, 146, width - CONTENT_RIGHT_MARGIN, 146), fill=0)
         draw.text((CONTENT_LEFT, 154), truncate(draw, signals, fonts["tiny"], content_width(width)), font=fonts["tiny"], fill=0)
@@ -1105,23 +1227,84 @@ def run_command(command: list[str]) -> str:
     return (result.stdout or "").strip() or "Unavailable"
 
 
+def read_first_line(path: str) -> str:
+    try:
+        return Path(path).read_text().splitlines()[0]
+    except Exception:
+        return ""
+
+
+def cpu_temperature_label() -> str:
+    raw = read_first_line("/sys/class/thermal/thermal_zone0/temp")
+    if not raw:
+        return "n/a"
+    try:
+        return f"{round(int(raw) / 1000)}C"
+    except ValueError:
+        return "n/a"
+
+
+def disk_usage_label() -> str:
+    try:
+        usage = shutil.disk_usage("/")
+    except OSError:
+        return "n/a"
+    used_pct = round((usage.used / usage.total) * 100)
+    return f"{used_pct}%"
+
+
+def uptime_label() -> str:
+    raw = read_first_line("/proc/uptime")
+    if not raw:
+        return "n/a"
+    try:
+        seconds = int(float(raw.split()[0]))
+    except (IndexError, ValueError):
+        return "n/a"
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def wifi_signal_label() -> str:
+    output = run_command(["iwconfig", "wlan0"])
+    if output == "Unavailable" or "Signal level=" not in output:
+        return ""
+    signal = output.split("Signal level=", 1)[1].split()[0]
+    return signal
+
+
 def render_diagnostics(config: Config, state: dict) -> Image.Image:
     _, canvas, draw, width, height = new_canvas(config)
     fonts = get_fonts(config)
     now = datetime.now(config.timezone)
     draw_top(draw, width, fonts, now, "Diagnostics", sync_label(state, config))
+    profile = resolve_profile(config, state, now)
+    ssid = run_command(["iwgetid", "-r"])
+    wifi_signal = wifi_signal_label()
+    wifi = f"{ssid} {wifi_signal}".strip() if ssid != "Unavailable" else "Unavailable"
+    clear_date = state.get("last_panel_clear_date") or "never"
     lines = [
-        f"Wi-Fi: {run_command(['iwgetid', '-r'])}",
+        f"Wi-Fi: {wifi}",
         f"IP: {get_ip_address()}",
-        f"Driver: {config.epd_driver}",
+        f"CPU: {cpu_temperature_label()} / Disk: {disk_usage_label()}",
+        f"Uptime: {uptime_label()}",
+        f"Profile: {profile_label(profile)}",
+        f"Panel clear: {clear_date}",
+        f"Driver: {config.epd_driver} r{config.display_rotation}",
         f"Auth: {config.auth_mode}",
         f"View: {state.get('view', 'home')}",
     ]
     for index, line in enumerate(lines):
-        draw.text((CONTENT_LEFT, 50 + index * 15), truncate(draw, line, fonts["tiny"], content_width(width)), font=fonts["tiny"], fill=0)
+        draw.text((CONTENT_LEFT, 42 + index * 13), truncate(draw, line, fonts["tiny"], content_width(width)), font=fonts["tiny"], fill=0)
     if state.get("last_error"):
-        draw.line((CONTENT_LEFT, 132, width - CONTENT_RIGHT_MARGIN, 132), fill=0)
-        draw.text((CONTENT_LEFT, 140), truncate(draw, state["last_error"], fonts["tiny"], content_width(width)), font=fonts["tiny"], fill=0)
+        draw.line((CONTENT_LEFT, 154, width - CONTENT_RIGHT_MARGIN, 154), fill=0)
+        draw.text((CONTENT_LEFT, 160), truncate(draw, state["last_error"], fonts["tiny"], content_width(width)), font=fonts["tiny"], fill=0)
     draw_left_menu(draw, width, height, fonts, "refresh")
     return canvas
 
@@ -1186,6 +1369,17 @@ def clear_display(config: Config):
     epd.sleep()
 
 
+def maybe_nightly_clear(config: Config, state: dict, now: datetime) -> bool:
+    if not config.nightly_clear_enabled or now.hour != config.nightly_clear_hour:
+        return False
+    today = now.date().isoformat()
+    if state.get("last_panel_clear_date") == today:
+        return False
+    clear_display(config)
+    state["last_panel_clear_date"] = today
+    return True
+
+
 def refresh_display(config: Config):
     with display_lock(config):
         state = load_state(config)
@@ -1194,6 +1388,10 @@ def refresh_display(config: Config):
             state["last_sync_iso"] = datetime.now(config.timezone).isoformat()
             state["last_error"] = None
             refresh_optional_signals(config, state)
+            now = datetime.now(config.timezone)
+            state["profile"] = resolve_profile(config, state, now)
+            if maybe_nightly_clear(config, state, now):
+                LOGGER.info("Nightly panel clear completed")
             canvas = render_view(config, state)
             status = "refresh ok"
         except Exception as exc:
@@ -1209,6 +1407,7 @@ def refresh_display(config: Config):
 def local_redraw(config: Config, status: str = "local redraw"):
     with display_lock(config):
         state = load_state(config)
+        state["profile"] = resolve_profile(config, state, datetime.now(config.timezone))
         save_state(config, state)
         push_display(config, render_view(config, state))
     emit_heartbeat(config, status)
@@ -1218,6 +1417,7 @@ def set_view(config: Config, view: str):
     with display_lock(config):
         state = load_state(config)
         state["view"] = view
+        state["profile"] = resolve_profile(config, state, datetime.now(config.timezone))
         save_state(config, state)
         push_display(config, render_view(config, state))
 
@@ -1238,6 +1438,7 @@ def toggle_focus(config: Config):
             state["focus_until_iso"] = (now + timedelta(minutes=minutes)).isoformat()
             state["focus_preset_index"] = (index + 1) % len(FOCUS_PRESETS)
         state["view"] = "focus"
+        state["profile"] = resolve_profile(config, state, now)
         save_state(config, state)
         push_display(config, render_focus(config, state))
 
@@ -1248,6 +1449,7 @@ def cycle_focus_preset(config: Config):
         index = int(state.get("focus_preset_index", 1)) % len(FOCUS_PRESETS)
         state["focus_preset_index"] = (index + 1) % len(FOCUS_PRESETS)
         state["view"] = "focus"
+        state["profile"] = resolve_profile(config, state, datetime.now(config.timezone))
         save_state(config, state)
         push_display(config, render_focus(config, state))
 
@@ -1255,6 +1457,8 @@ def cycle_focus_preset(config: Config):
 def show_diagnostics(config: Config):
     with display_lock(config):
         state = load_state(config)
+        state["profile"] = resolve_profile(config, state, datetime.now(config.timezone))
+        save_state(config, state)
         push_display(config, render_diagnostics(config, state))
 
 
@@ -1328,6 +1532,7 @@ def run_listener(config: Config):
                 with display_lock(config):
                     state = load_state(config)
                     if should_redraw_for_clock(config, state, datetime.now(config.timezone)):
+                        state["profile"] = resolve_profile(config, state, datetime.now(config.timezone))
                         save_state(config, state)
                         push_display(config, render_view(config, state))
                 next_timer = time.monotonic() + config.timer_refresh_seconds
@@ -1418,13 +1623,17 @@ def render_sample(config: Config, output: Path, view: str):
     state["weather"] = {
         "enabled": True,
         "temperature": 15.7,
+        "precipitation": 0.1,
+        "wind": 18,
         "summary": "showers",
         "commute_label": "18:00",
         "commute_precip_probability": 40,
+        "commute_precipitation": 0.4,
         "fetched_at": datetime.now(config.timezone).isoformat(),
         "error": None,
     }
-    canvas = render_view(config, state)
+    state["last_panel_clear_date"] = datetime.now(config.timezone).date().isoformat()
+    canvas = render_diagnostics(config, state) if view == "diagnostics" else render_view(config, state)
     output.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output)
     blank = Image.new("1", canvas.size, 255)
@@ -1439,7 +1648,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--login", action="store_true", help="Run one-time Microsoft device-code login")
     parser.add_argument("--sample", action="store_true", help="Render with sample data")
     parser.add_argument("--preview", type=Path, help="Render to PNG instead of e-ink")
-    parser.add_argument("--view", choices=sorted(VIEWS), default="home")
+    parser.add_argument("--view", choices=sorted(VIEWS | {"diagnostics"}), default="home")
     return parser.parse_args()
 
 

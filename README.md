@@ -10,8 +10,9 @@ It shows:
 - Agenda: two-column next-meeting grid
 - Focus: local focus timer
 - Tomorrow: two-column day preview with first meeting, meeting count, and booked time
-- Mail/weather signal: unread count, high-priority unread count, current weather, and commute-hour rain chance
-- Diagnostics: Wi-Fi, IP, auth mode, display driver
+- Mail/weather signal: unread count, high-priority unread count, and only actionable weather alerts
+- Automatic profiles: workday, meeting-heavy, focus-day, weekend, and quiet
+- Diagnostics: Wi-Fi, IP, CPU temperature, disk usage, uptime, profile, auth mode, and display driver
 
 The compact icon navigation rail is on the left side to match the physical HAT buttons. After work hours, Home switches into a quiet mode that shows only tomorrow and weather.
 
@@ -82,6 +83,31 @@ DESK_WEATHER_LATITUDE=52.3676
 DESK_WEATHER_LONGITUDE=4.9041
 DESK_WEATHER_LABEL=Amsterdam
 DESK_COMMUTE_WEATHER_HOUR=18
+DESK_WEATHER_RAIN_THRESHOLD_PERCENT=35
+DESK_WEATHER_PRECIP_THRESHOLD_MM=0.2
+DESK_WEATHER_WIND_THRESHOLD_KMH=35
+DESK_WEATHER_COLD_THRESHOLD_C=3
+DESK_WEATHER_HOT_THRESHOLD_C=28
+```
+
+Weather stays quiet on the main work views unless it crosses one of those thresholds. Quiet mode still shows a simple current weather line when there is no alert.
+
+Profiles are automatic by default:
+
+```bash
+DESK_PROFILE_MODE=auto
+DESK_PROFILE_MEETING_HEAVY_COUNT=5
+DESK_PROFILE_MEETING_HEAVY_BUSY_MINUTES=240
+DESK_PROFILE_FOCUS_DAY_OPEN_HOURS=4
+```
+
+Set `DESK_PROFILE_MODE` to `workday`, `meeting-heavy`, `focus-day`, `weekend`, or `quiet` to force a profile.
+
+The panel performs a full clear once per day during the configured night hour:
+
+```bash
+DESK_NIGHTLY_CLEAR_ENABLED=1
+DESK_NIGHTLY_CLEAR_HOUR=3
 ```
 
 The app repaints sparingly: full calendar refreshes happen on the configured cadence, while timer redraws only occur for active focus, active meetings, meeting-start warnings, and meeting boundaries.
@@ -96,7 +122,10 @@ python3 -m venv .venv
 .venv/bin/python src/info_screen.py --sample --preview docs/screenshots/focus.png --view focus
 .venv/bin/python src/info_screen.py --sample --preview docs/screenshots/tomorrow.png --view tomorrow
 DESK_OFFICE_END_HOUR=16 .venv/bin/python src/info_screen.py --sample --preview docs/screenshots/quiet.png --view home
+.venv/bin/python src/info_screen.py --sample --preview docs/screenshots/diagnostics.png --view diagnostics
 ```
+
+`docs/screenshots/diagnostics.png` shows the long-press diagnostics view.
 
 The live Pi render is saved to `docs/screenshots/pi-current-render.png` for documentation.
 
